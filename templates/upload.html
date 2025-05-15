@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html>
+<head><title>Upload PDF</title></head>
+<body>
+  <h1>PDF Extractor</h1>
+
+  <form method="post" enctype="multipart/form-data">
+    <input type="file" name="pdf" accept="application/pdf" required>
+    <button type="submit">Upload & Extract</button>
+  </form>
+
+  <h2>Past Reports</h2>
+  <ul>
+    {% for row in past %}
+      <li>
+        <a href="{{ url_for('download_file', filename=row['filename']) }}">
+          {{ row['filename'] }}
+        </a>
+        — <a href="{{ url_for('show_result', report_id=row['id']) }}">View Data</a>
+      </li>
+    {% else %}
+      <li>No reports yet.</li>
+    {% endfor %}
+  </ul>
+</body>
+</html>
