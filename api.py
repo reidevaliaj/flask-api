@@ -1,4 +1,5 @@
-import os, re, json, sqlite3, pdfplumber, openai
+import os, re, json, sqlite3, pdfplumber
+from openai import OpenAI
 from flask import Flask, request, jsonify, render_template, redirect, url_for, send_from_directory, flash
 from dotenv import load_dotenv
 
@@ -9,7 +10,7 @@ load_dotenv()  # load OPENAI_API_KEY from .env locally
 app = Flask(__name__, static_folder='uploads')
 app.secret_key = os.getenv('FLASK_SECRET', 'supersecret')
 
-openai.api_key = os.getenv('OPENAI_API_KEY')
+client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
 
 UPLOAD_FOLDER = 'uploads'
 DB_PATH       = 'extracted.db'
@@ -83,13 +84,14 @@ def call_ai(kw, snippets):
       '{"metric": "...", "value": "...", "unit": "...", "year": ...}\\n\\n'
       + "\n---\n".join(snippets)
     )
-    resp = openai.ChatCompletion.create(
+    resp = client.chat.completions.create(
       model="gpt-4",
       messages=[
         {"role":"system","content":"You are a financial data extractor."},
         {"role":"user","content":prompt}
       ]
     )
+    
     txt = resp.choices[0].message.content.strip()
     try:
         return json.loads(txt)
