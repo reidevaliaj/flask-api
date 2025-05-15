@@ -38,12 +38,13 @@ logger.info("Initialized app with upload folder '%s' and DB '%s'", UPLOAD_FOLDER
 #  B) Database helpers (SQLite)
 # ——————————————————————————————————————————————————————————————————————
 def get_db():
-    return sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
 def init_db():
     db = get_db()
-    db.row_factory = sqlite3.Row
     db.execute(
         '''CREATE TABLE IF NOT EXISTS extracted_reports (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -60,10 +61,9 @@ init_db()
 # ——————————————————————————————————————————————————————————————————————
 #  C) Two-phase PDF extraction logic
 # ——————————————————————————————————————————————————————————————————————
-
 def find_relevant_pages(pdf_path, keywords):
     """
-    Phase 1: fast, text-only scan using PyMuPDF to flag pages containing keywords
+    Phase 1: fast, text-only scan using PyMuPD to flag pages containing keywords
     """
     logger.info("Phase 1: Scanning PDF '%s' for keywords %s", pdf_path, keywords)
     doc = fitz.open(pdf_path)
@@ -99,7 +99,23 @@ def extract_page_content(pdf_path, hit_pages):
     return "\n".join(raw_text), table_rows
 
 
+def find_contexts(text, keyword, window_chars=200):
+    """Extracts text snippets around each occurrence of keyword"""
+    contexts = []
+    for m in re.finditer(re.escape(keyword), text, re.IGNORECASE):
+        start = max(0, m.start() - window_chars)
+        end = m.end() + window_chars
+        contexts.append(text[start:end])
+    return contexts
+
+
+def find_table_rows(table_rows, keyword):
+    """Filters table rows that contain the keyword"""
+    return [row for row in table_rows if keyword.lower() in row.lower()]
+
+
 def prepare_snippets(raw_text, table_rows, max_snippets=20):
+    """Combines context snippets and table rows for AI input"""
     snippets = []
     for kw in KEYWORDS:
         snippets.extend(find_contexts(raw_text, kw))
@@ -111,6 +127,7 @@ def prepare_snippets(raw_text, table_rows, max_snippets=20):
 
 
 def call_ai(kw, snippets):
+    """Sends snippets to OpenAI and returns parsed JSON result"""
     logger.info("Calling AI for keyword '%s' with %d snippets", kw, len(snippets))
     prompt = (
         f"Extract the value, unit & year for '{kw}' from the snippets below. "
@@ -168,7 +185,6 @@ def upload():
 
         # Store in DB
         db = get_db()
-        db.row_factory = sqlite3.Row
         db.execute("INSERT INTO extracted_reports (filename, result_json) VALUES (?, ?)",
                    (filename, json.dumps(results)))
         db.commit()
