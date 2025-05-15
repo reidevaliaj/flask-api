@@ -1,4 +1,10 @@
-import os, re, json, sqlite3, pdfplumber
+import os
+import re
+import json
+import sqlite3
+import tempfile
+import fitz  # PyMuPDF for fast text scanning
+import pdfplumber
 from openai import OpenAI
 from flask import Flask, request, jsonify, render_template, redirect, url_for, send_from_directory, flash
 from dotenv import load_dotenv
@@ -6,9 +12,9 @@ from dotenv import load_dotenv
 # ——————————————————————————————————————————————————————————————————————
 #  A) Setup & config
 # ——————————————————————————————————————————————————————————————————————
-load_dotenv()  # load OPENAI_API_KEY from .env locally
+load_dotenv()  # load OPENAI_API_KEY & FLASK_SECRET from .env locally
 app = Flask(__name__, static_folder='uploads')
-app.secret_key = os.getenv('FLASK_SECRET', 'supersecret')
+app.secret_key = os.getenv('FLASK_SECRET', os.urandom(24))
 
 client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
 
@@ -29,6 +35,7 @@ def get_db():
     conn.row_factory = sqlite3.Row
     return conn
 
+
 def init_db():
     db = get_db()
     db.execute(
@@ -44,92 +51,124 @@ def init_db():
 init_db()
 
 # ——————————————————————————————————————————————————————————————————————
-#  C) PDF extraction logic (your existing code)
+#  C) Two-phase PDF extraction logic with PyMuPDF and pdfplumber
 # ——————————————————————————————————————————————————————————————————————
-def extract_page_content(pdf_path):
-    raw_text, table_rows = [], []
+
+def find_relevant_pages(pdf_path, keywords):
+    """
+    Phase 1: fast, text-only scan using PyMuPDF to flag pages containing keywords
+    """
+    doc = fitz.open(pdf_path)
+    keyset = [k.lower() for k in keywords]
+    hits = []
+    for i, page in enumerate(doc):
+        text = page.get_text() or ""
+        if any(k in text.lower() for k in keyset):
+            hits.append(i)
+    return hits
+
+
+def extract_page_content(pdf_path, hit_pages):
+    """
+    Phase 2: heavy parsing (text + tables) only on flagged pages via pdfplumber
+    """
+    raw_text = []
+    table_rows = []
     with pdfplumber.open(pdf_path) as pdf:
-        for page in pdf.pages:
-            txt = page.extract_text() or ""
-            raw_text.append(txt)
-            for table in page.extract_tables():
-                for row in table:
-                    table_rows.append(" | ".join(cell or "" for cell in row))
+        for idx in hit_pages:
+            if idx < len(pdf.pages):
+                page = pdf.pages[idx]
+                text = page.extract_text() or ""
+                raw_text.append(text)
+                for table in page.extract_tables():
+                    for row in table:
+                        table_rows.append(" | ".join(cell or "" for cell in row))
     return "\n".join(raw_text), table_rows
 
-def find_contexts(text, kw, window=200):
+
+def find_contexts(text, keyword, window_chars=200):
     out = []
-    for m in re.finditer(re.escape(kw), text, re.IGNORECASE):
-        s = max(0, m.start()-window)
-        e = m.end()+window
+    for m in re.finditer(re.escape(keyword), text, re.IGNORECASE):
+        s = max(0, m.start() - window_chars)
+        e = m.end() + window_chars
         out.append(text[s:e])
     return out
 
-def find_table_rows(rows, kw):
-    return [r for r in rows if kw.lower() in r.lower()]
 
-def prepare_snippets(raw, rows, maxn=20):
+def find_table_rows(table_rows, keyword):
+    return [r for r in table_rows if keyword.lower() in r.lower()]
+
+
+def prepare_snippets(raw_text, table_rows, max_snippets=20):
     snippets = []
     for kw in KEYWORDS:
-        snippets += find_contexts(raw, kw)
-        snippets += find_table_rows(rows, kw)
-        if len(snippets)>=maxn:
+        snippets.extend(find_contexts(raw_text, kw))
+        snippets.extend(find_table_rows(table_rows, kw))
+        if len(snippets) >= max_snippets:
             break
-    return snippets[:maxn]
+    return snippets[:max_snippets]
+
 
 def call_ai(kw, snippets):
     prompt = (
-      f"Extract the value, unit & year for “{kw}” from the snippets below. "
-      "Reply ONLY with JSON like "
-      '{"metric": "...", "value": "...", "unit": "...", "year": ...}\\n\\n'
-      + "\n---\n".join(snippets)
+        f"Extract the value, unit & year for '{kw}' from the snippets below. "
+        "Reply ONLY with JSON: {\"metric\":...,\"value\":...,\"unit\":...,\"year\":...}\n\n"
+        + "\n---\n".join(snippets)
     )
     resp = client.chat.completions.create(
-      model="gpt-4",
-      messages=[
-        {"role":"system","content":"You are a financial data extractor."},
-        {"role":"user","content":prompt}
-      ]
+        model="gpt-4",
+        messages=[
+            {"role": "system", "content": "You are a financial data extractor."},
+            {"role": "user", "content": prompt}
+        ]
     )
-    
-    txt = resp.choices[0].message.content.strip()
+    text = resp.choices[0].message.content.strip()
     try:
-        return json.loads(txt)
-    except:
-        return {"error":"parse_failed","raw":txt}
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return {"error": "Invalid JSON", "raw": text}
 
 # ——————————————————————————————————————————————————————————————————————
-#  D) Routes
+#  D) Routes (upload, results, download)
 # ——————————————————————————————————————————————————————————————————————
 @app.route('/', methods=['GET','POST'])
 def upload():
-    if request.method=='POST':
+    if request.method == 'POST':
         f = request.files.get('pdf')
         if not f:
             flash("Please select a PDF.")
             return redirect(url_for('upload'))
 
-        # 1) Save PDF
-        save_path = os.path.join(UPLOAD_FOLDER, f.filename)
-        f.save(save_path)
+        # Save to temp file
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.pdf')
+        pdf_path = tmp.name
+        tmp.close()
+        f.save(pdf_path)
 
-        # 2) Extract
-        raw, rows  = extract_page_content(save_path)
-        snippets   = prepare_snippets(raw, rows)
-        results    = {kw: call_ai(kw, snippets) for kw in KEYWORDS}
+        # Two-phase extraction
+        hit_pages = find_relevant_pages(pdf_path, KEYWORDS)
+        if not hit_pages:
+            os.remove(pdf_path)
+            flash("No relevant pages found.")
+            return redirect(url_for('upload'))
 
-        # 3) Store in DB
+        raw_text, table_rows = extract_page_content(pdf_path, hit_pages)
+        snippets = prepare_snippets(raw_text, table_rows)
+        results = {kw: call_ai(kw, snippets) for kw in KEYWORDS}
+
+        # Store in DB
         db = get_db()
         db.execute(
           "INSERT INTO extracted_reports (filename, result_json) VALUES (?, ?)",
           (f.filename, json.dumps(results))
         )
         db.commit()
-        report_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+        rec_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
 
-        return redirect(url_for('show_result', report_id=report_id))
+        os.remove(pdf_path)
+        return redirect(url_for('show_result', report_id=rec_id))
 
-    # GET → show upload form + list of past PDFs
+    # GET: show upload form + past reports
     db = get_db()
     past = db.execute("SELECT * FROM extracted_reports ORDER BY created_at DESC").fetchall()
     return render_template('upload.html', past=past)
@@ -137,7 +176,7 @@ def upload():
 @app.route('/results/<int:report_id>')
 def show_result(report_id):
     db = get_db()
-    rec = db.execute("SELECT * FROM extracted_reports WHERE id=?",(report_id,)).fetchone()
+    rec = db.execute("SELECT * FROM extracted_reports WHERE id=?", (report_id,)).fetchone()
     data = json.loads(rec['result_json'])
     return render_template('results.html', filename=rec['filename'], data=data)
 
@@ -145,6 +184,5 @@ def show_result(report_id):
 def download_file(filename):
     return send_from_directory(UPLOAD_FOLDER, filename, as_attachment=True)
 
-# ——————————————————————————————————————————————————————————————————————
-if __name__=='__main__':
-    app.run(host='0.0.0.0', port=5000)
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000, debug=True)
